@@ -31,8 +31,9 @@ from util.util import AverageMeter, poly_learning_rate, intersectionAndUnionGPU
 ## to implement Transformer
 from models.factory import create_segmenter
 
-#device = torch.device("cuda" if torch.cuda.is_available() else "cpu") FILS DE PUTES
-device = torch_directml.device()
+# Configure DirectML device globally if no CUDA support
+device = torch_directml.device() if not torch.cuda.is_available() else torch.device("cuda")
+
 
 
 def convert_color_to_class(label_image, color_encoding):
@@ -200,9 +201,7 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.data_root,
         transform=image_transform,
         label_transform=label_transform)
-    color_encoding = train_data.color_encoding  # Récupère le mapping de couleurs
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
-
 
     if args.evaluate:
         label_transform = transforms.Compose([
@@ -218,7 +217,7 @@ def main_worker(gpu, ngpus_per_node, argss):
     for epoch in range(args.start_epoch, args.epochs):
         epoch_log = epoch + 1
 
-        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch, color_encoding)
+        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch)
         # record train loss and miou corresponding to each epoch
         train_epochs.append(epoch)
         train_loss.append(loss_train)
@@ -248,7 +247,7 @@ def main_worker(gpu, ngpus_per_node, argss):
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
 
-def train(train_loader, model, optimizer, epoch, color_encoding):
+def train(train_loader, model, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     main_loss_meter = AverageMeter()
@@ -270,11 +269,6 @@ def train(train_loader, model, optimizer, epoch, color_encoding):
             target = F.interpolate(target.unsqueeze(1).float(), size=(h, w), mode='bilinear', align_corners=True).squeeze(1).long()
 
         input = input.to(device).float()
-        # Convertit les étiquettes de couleur en indices de classe
-        # First handle the permute and conversion while it's still a PyTorch tensor
-        target = torch.stack(
-            [convert_color_to_class(t.permute(1, 2, 0).cpu().numpy(), color_encoding) for t in target.cpu()])
-        # Send the result to the device
         target = target.to(device)
 
         output, main_loss, aux_loss = model(input, target)
