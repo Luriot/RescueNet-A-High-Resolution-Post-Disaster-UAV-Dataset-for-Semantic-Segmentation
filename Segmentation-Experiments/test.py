@@ -36,6 +36,7 @@ device = torch_directml.device()
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
     parser.add_argument('--config', type=str, default='config/rescuenet-pspnet101.yaml', help='config file')
+
     parser.add_argument('opts', help='see config/rescuenet-pspnet101.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
@@ -165,9 +166,9 @@ def main():
         transform=image_transform,
         label_transform=label_transform)
     test_loader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
-    
-    colors = np.loadtxt(args.colors_path).astype('uint8')
-    names = [line.rstrip('\n') for line in open(args.names_path)]
+
+    colors = test_data.color_encoding
+    names = list(test_data.color_encoding.keys())
 
     if not args.has_prediction:
         if args.arch == 'pspnet':
@@ -331,7 +332,11 @@ def predict(model, images, paths, class_encoding):
         if args.predict_color:
             save_image(predict, outname_final)
         else:
-            io.imsave(outname_final, predict.cpu())
+            # Convertir en type uint8 manuellement
+            predict_uint8 = (predict.cpu().numpy() * 255).astype(np.uint8)
+            predict_uint8 = 255 - predict_uint8  # Inversion des valeurs pour avoir le fond en noir
+            # Sauvegarder l'image en tant qu'image 8 bits
+            io.imsave(outname_final, predict_uint8)
 
 if __name__ == '__main__':
     main()
