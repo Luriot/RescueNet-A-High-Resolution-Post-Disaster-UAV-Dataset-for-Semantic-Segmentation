@@ -10,6 +10,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torch.nn.parallel
 import torch.utils.data
+import torch_directml
 
 from util import dataset, transform, config
 from util.util import AverageMeter, poly_learning_rate, intersectionAndUnionGPU, check_makedirs, colorize, enet_weighing # @sh: add
@@ -30,12 +31,12 @@ from torchvision.utils import save_image
 from models.factory import create_segmenter
 
 
-device = torch.device('cuda')
+device = torch_directml.device()
 
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/michael/rescuenet-pspnet101.yaml', help='config file')
-    parser.add_argument('opts', help='see config/michael/rescuenet-pspnet101.yaml for all options', default=None, nargs=argparse.REMAINDER)
+    parser.add_argument('--config', type=str, default='config/rescuenet-pspnet101.yaml', help='config file')
+    parser.add_argument('opts', help='see config/rescuenet-pspnet101.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
     cfg = config.load_cfg_from_cfg_file(args.config)
@@ -103,7 +104,7 @@ def main():
 
     # Import the requested dataset
     if args.dataset.lower() == 'rescuenet':
-        from data import RescueNetv2 as dataset
+        from data import RescueNet as dataset
     else:
         # Should never happen...but just in case it does
         raise RuntimeError("\"{0}\" is not a supported dataset.".format(
@@ -173,8 +174,8 @@ def main():
             from models.pspnet import PSPNet
             model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, pretrained=False)
         elif args.arch == 'psa':
-            from model.psanet import PSANet
-            model = PSANet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, compact=args.compact,
+            from models.pspnet import PSPNet
+            model = PSPNet(layers=args.layers, classes=args.classes, zoom_factor=args.zoom_factor, compact=args.compact,
                            shrink_factor=args.shrink_factor, mask_h=args.mask_h, mask_w=args.mask_w,
                            normalization_factor=args.normalization_factor, psa_softmax=args.psa_softmax,
                            pretrained=False)
@@ -185,7 +186,7 @@ def main():
             model = create_segmenter(args)
 
         logger.info(model)
-        model = torch.nn.DataParallel(model).cuda()
+        model = model.to(device)
         cudnn.benchmark = True
         if os.path.isfile(args.model_path):
             logger.info("=> loading checkpoint '{}'".format(args.model_path))
@@ -209,7 +210,7 @@ def net_process(model, image, mean, std=None, flip=True):
     else:
         for t, m, s in zip(input, mean, std):
             t.sub_(m).div_(s)
-    input = input.unsqueeze(0).cuda()
+    input = input.unsqueeze(0).to(device)
     if flip:
         input = torch.cat([input, input.flip(3)], 0)
     with torch.no_grad():

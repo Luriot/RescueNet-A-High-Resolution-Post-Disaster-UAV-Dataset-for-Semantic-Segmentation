@@ -1,8 +1,10 @@
 import torch
+import torch_directml
 from torch import nn
 import torch.nn.functional as F
+import torchvision.models as models  # Utilisation de torchvision pour ResNet
 
-import models.resnet as models
+device = torch_directml.device()
 
 
 class PPM(nn.Module):
@@ -27,7 +29,8 @@ class PPM(nn.Module):
 
 
 class PSPNet(nn.Module):
-    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True, criterion=nn.CrossEntropyLoss(ignore_index=255), BatchNorm=nn.BatchNorm2d, pretrained=True):
+    def __init__(self, layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=2, zoom_factor=8, use_ppm=True,
+                 criterion=nn.CrossEntropyLoss(ignore_index=255), BatchNorm=nn.BatchNorm2d, pretrained=True):
         super(PSPNet, self).__init__()
         assert layers in [50, 101, 152]
         assert 2048 % len(bins) == 0
@@ -38,15 +41,21 @@ class PSPNet(nn.Module):
         self.criterion = criterion
         models.BatchNorm = BatchNorm
 
+        # Charger ResNet depuis torchvision
         if layers == 50:
-            resnet = models.resnet50(pretrained=pretrained)
+            resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
         elif layers == 101:
-            resnet = models.resnet101(pretrained=pretrained)
+            resnet = models.resnet101(weights=models.ResNet101_Weights.DEFAULT if pretrained else None)
         else:
-            resnet = models.resnet152(pretrained=pretrained)
-        self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.conv2, resnet.bn2, resnet.relu, resnet.conv3, resnet.bn3, resnet.relu, resnet.maxpool)
+            resnet = models.resnet152(weights=models.ResNet152_Weights.DEFAULT if pretrained else None)
+
+        # Extraire les couches de base de ResNet sans conv2, conv3
+        self.layer0 = nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool
+        )
         self.layer1, self.layer2, self.layer3, self.layer4 = resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
 
+        # Appliquer le dilatation pour augmenter le champ réceptif
         for n, m in self.layer3.named_modules():
             if 'conv2' in n:
                 m.dilation, m.padding, m.stride = (2, 2), (2, 2), (1, 1)
@@ -60,7 +69,7 @@ class PSPNet(nn.Module):
 
         fea_dim = 2048
         if use_ppm:
-            self.ppm = PPM(fea_dim, int(fea_dim/len(bins)), bins, BatchNorm)
+            self.ppm = PPM(fea_dim, int(fea_dim / len(bins)), bins, BatchNorm)
             fea_dim *= 2
         self.cls = nn.Sequential(
             nn.Conv2d(fea_dim, 512, kernel_size=3, padding=1, bias=False),
@@ -80,7 +89,7 @@ class PSPNet(nn.Module):
 
     def forward(self, x, y=None):
         x_size = x.size()
-        assert (x_size[2]-1) % 8 == 0 and (x_size[3]-1) % 8 == 0
+        assert (x_size[2] - 1) % 8 == 0 and (x_size[3] - 1) % 8 == 0
         h = int((x_size[2] - 1) / 8 * self.zoom_factor + 1)
         w = int((x_size[3] - 1) / 8 * self.zoom_factor + 1)
 
@@ -92,17 +101,14 @@ class PSPNet(nn.Module):
         if self.use_ppm:
             x = self.ppm(x)
         x = self.cls(x)
-        #print("final model output shape: ", x.shape) # @sh: debug
         if self.zoom_factor != 1:
             x = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
-        #print("final model output shape: ", x.shape) # @sh: debug
         if self.training:
             aux = self.aux(x_tmp)
             if self.zoom_factor != 1:
                 aux = F.interpolate(aux, size=(h, w), mode='bilinear', align_corners=True)
             main_loss = self.criterion(x, y)
             aux_loss = self.criterion(aux, y)
-            #print("Returned output from PSPNet: ", (x.max(1)[1]).shape) # @sh: debug
             return x.max(1)[1], main_loss, aux_loss
         else:
             return x
@@ -110,9 +116,11 @@ class PSPNet(nn.Module):
 
 if __name__ == '__main__':
     import os
+
     os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1'
-    input = torch.rand(4, 3, 473, 473).cuda()
-    model = PSPNet(layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=21, zoom_factor=1, use_ppm=True, pretrained=True).cuda()
+    input = torch.rand(4, 3, 473, 473).to(device)
+    model = PSPNet(layers=50, bins=(1, 2, 3, 6), dropout=0.1, classes=21, zoom_factor=1, use_ppm=True,
+                   pretrained=True).to(device)
     model.eval()
     print(model)
     output = model(input)

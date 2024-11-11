@@ -1,10 +1,13 @@
 import os
 import numpy as np
+import torch_directml
 from PIL import Image
 
 import torch
 from torch import nn
 import torch.nn.init as initer
+
+device = torch_directml.device()
 
 
 class AverageMeter(object):
@@ -65,7 +68,7 @@ def intersectionAndUnionGPU(output, target, K, ignore_index=255):
     area_output = torch.histc(output.float().cpu(), bins=K, min=0, max=K-1)
     area_target = torch.histc(target.float().cpu(), bins=K, min=0, max=K-1)
     area_union = area_output + area_target - area_intersection
-    return area_intersection.cuda(), area_union.cuda(), area_target.cuda()
+    return area_intersection.to(device), area_union.to(device), area_target.to(device)
 
 
 def check_mkdir(dir_name):

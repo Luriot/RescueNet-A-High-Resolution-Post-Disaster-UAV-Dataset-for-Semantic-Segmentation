@@ -2,8 +2,9 @@ import os
 import logging
 import numpy as np
 import time
-import cv2 
+import cv2
 import argparse
+
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -13,6 +14,12 @@ import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.multiprocessing as mp
+import torch.distributed as dist
+from test import Test  # Depuis test.py
+import utils  # Importer utils directement
+from torchmetrics import JaccardIndex as IoU
+
+import torch_directml
 
 from PIL import Image
 import torchvision.transforms as transforms
@@ -24,14 +31,34 @@ from util.util import AverageMeter, poly_learning_rate, intersectionAndUnionGPU
 ## to implement Transformer
 from models.factory import create_segmenter
 
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu") FILS DE PUTES
+device = torch_directml.device()
+
+
+def convert_color_to_class(label_image, color_encoding):
+    """
+    Convertit une image d'étiquette de couleur en indices de classe.
+    Args:
+        label_image (numpy.ndarray): L'image d'étiquette de couleur (H x W x 3).
+        color_encoding (OrderedDict): Dictionnaire mappant les couleurs aux classes.
+    Returns:
+        torch.Tensor: Image d'étiquette avec des indices de classe (H x W).
+    """
+    label_class = np.zeros((label_image.shape[0], label_image.shape[1]), dtype=np.int64)
+    for idx, color in enumerate(color_encoding.values()):
+        mask = (label_image == color).all(axis=2)
+        label_class[mask] = idx
+    return torch.from_numpy(label_class)
+
+
 def get_parser():
     parser = argparse.ArgumentParser(description='PyTorch Semantic Segmentation')
-    parser.add_argument('--config', type=str, default='config/michael/rescuenet-pspnet101.yaml', help='config file')
-    parser.add_argument('opts', help='see config/michael/rescuenet-pspnet101.yaml for all options', default=None, nargs=argparse.REMAINDER)
+    parser.add_argument('--config', type=str, default='config/rescuenet-pspnet101.yaml', help='config file')
+    parser.add_argument('opts', help='see config/rescuenet-pspnet101.yaml for all options', default=None, nargs=argparse.REMAINDER)
     args = parser.parse_args()
     assert args.config is not None
     cfg = config.load_cfg_from_cfg_file(args.config)
-    
+
     if args.opts is not None:
         cfg = config.merge_cfg_from_list(cfg, args.opts)
     return cfg
@@ -51,25 +78,31 @@ def main_process():
 
 def main():
     args = get_parser()
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(x) for x in args.train_gpu)
-    
-    if args.dist_url == "env://" and args.world_size == -1:
-        args.world_size = int(os.environ["WORLD_SIZE"])
+
+    global train_epochs, train_loss, train_accuracy, val_epochs, val_loss, val_accuracy
+    train_epochs, train_loss, train_accuracy = [], [], []
+    val_epochs, val_loss, val_accuracy = [], [], []
+
+    # Configurez le dispositif DirectML
+    device = torch_directml.device()
+
+    # Supprimez les lignes liées à CUDA
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
     args.ngpus_per_node = len(args.train_gpu)
     if len(args.train_gpu) == 1:
         args.sync_bn = False
         args.distributed = False
         args.multiprocessing_distributed = False
-    
-    main_worker(args.train_gpu, args.ngpus_per_node, args)
+
+    # Passez `device` à main_worker pour l'utiliser dans l'ensemble du modèle
+    main_worker(device, args.ngpus_per_node, args)
 
 def main_worker(gpu, ngpus_per_node, argss):
     global args
     args = argss
     print(args)
-    
+
+
     BatchNorm = nn.BatchNorm2d
 
     criterion = nn.CrossEntropyLoss(ignore_index=args.ignore_label)
@@ -109,8 +142,8 @@ def main_worker(gpu, ngpus_per_node, argss):
         logger.info("=> creating model ...")
         logger.info("Classes: {}".format(args.classes))
         logger.info(model)
-    
-    model = torch.nn.DataParallel(model.cuda()) # @sh: add to avoid prev commented out block 
+
+    model = model.to(device) # @sh: add to avoid prev commented out block
 
     if args.weight:
         if os.path.isfile(args.weight):
@@ -129,7 +162,7 @@ def main_worker(gpu, ngpus_per_node, argss):
             if main_process():
                 logger.info("=> loading checkpoint '{}'".format(args.resume))
             # checkpoint = torch.load(args.resume)
-            checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.cuda())
+            checkpoint = torch.load(args.resume, map_location=lambda storage, loc: storage.to(device))
             args.start_epoch = checkpoint['epoch']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -147,7 +180,7 @@ def main_worker(gpu, ngpus_per_node, argss):
 
     # Import the requested dataset
     if args.dataset.lower() == 'rescuenet':
-        from data import RescueNetv2 as dataset
+        from data import RescueNet as dataset
     else:
         # Should never happen...but just in case it does
         raise RuntimeError("\"{0}\" is not a supported dataset.".format(
@@ -167,8 +200,10 @@ def main_worker(gpu, ngpus_per_node, argss):
         args.data_root,
         transform=image_transform,
         label_transform=label_transform)
+    color_encoding = train_data.color_encoding  # Récupère le mapping de couleurs
     train_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, drop_last=True)
-    
+
+
     if args.evaluate:
         label_transform = transforms.Compose([
             transforms.Resize((args.train_h, args.train_w), Image.NEAREST),
@@ -179,11 +214,11 @@ def main_worker(gpu, ngpus_per_node, argss):
             transform=image_transform,
             label_transform=label_transform)
         val_loader = torch.utils.data.DataLoader(val_data, batch_size=args.batch_size_val, shuffle=False, num_workers=args.workers)
-        
+
     for epoch in range(args.start_epoch, args.epochs):
         epoch_log = epoch + 1
-        
-        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch)
+
+        loss_train, mIoU_train, mAcc_train, allAcc_train = train(train_loader, model, optimizer, epoch, color_encoding)
         # record train loss and miou corresponding to each epoch
         train_epochs.append(epoch)
         train_loss.append(loss_train)
@@ -213,7 +248,7 @@ def main_worker(gpu, ngpus_per_node, argss):
                 writer.add_scalar('mAcc_val', mAcc_val, epoch_log)
                 writer.add_scalar('allAcc_val', allAcc_val, epoch_log)
 
-def train(train_loader, model, optimizer, epoch):
+def train(train_loader, model, optimizer, epoch, color_encoding):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     main_loss_meter = AverageMeter()
@@ -233,16 +268,22 @@ def train(train_loader, model, optimizer, epoch):
             w = int((target.size()[2] - 1) / 8 * args.zoom_factor + 1)
             # 'nearest' mode doesn't support align_corners mode and 'bilinear' mode is fine for downsampling
             target = F.interpolate(target.unsqueeze(1).float(), size=(h, w), mode='bilinear', align_corners=True).squeeze(1).long()
-        
-        input = input.cuda(non_blocking=True).float()
-        target = target.cuda(non_blocking=True)
+
+        input = input.to(device).float()
+        # Convertit les étiquettes de couleur en indices de classe
+        # First handle the permute and conversion while it's still a PyTorch tensor
+        target = torch.stack(
+            [convert_color_to_class(t.permute(1, 2, 0).cpu().numpy(), color_encoding) for t in target.cpu()])
+        # Send the result to the device
+        target = target.to(device)
+
         output, main_loss, aux_loss = model(input, target)
         if not args.multiprocessing_distributed:
             main_loss, aux_loss = torch.mean(main_loss), torch.mean(aux_loss)
         loss = main_loss + args.aux_weight * aux_loss
-        
+
         optimizer.zero_grad()
-        loss.backward() 
+        loss.backward()
         optimizer.step()
 
         n = input.size(0)
@@ -323,8 +364,8 @@ def validate(val_loader, model, criterion):
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
         data_time.update(time.time() - end)
-        input = input.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        input = input.to(device)
+        target = target.to(device)
         output = model(input)
         if args.zoom_factor != 8:
             output = F.interpolate(output, size=target.size()[1:], mode='bilinear', align_corners=True)
